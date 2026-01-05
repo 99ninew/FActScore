@@ -5,47 +5,6 @@ import torch
 import tqdm
 import transformers
 
-
-def download_file(_id, dest, cache_dir):
-    if os.path.exists(dest) or os.path.exists(os.path.join(cache_dir, dest)):
-        print ("[Already exists] Skipping", dest)
-        print ("If you want to download the file in another location, please specify a different path")
-        return
-
-    if os.path.exists(dest.replace(".zip", "")) or os.path.exists(os.path.join(cache_dir, dest.replace(".zip", ""))):
-        print ("[Already exists] Skipping", dest)
-        print ("If you want to download the file in another location, please specify a different path")
-        return
-
-    if "/" in dest:
-        dest_dir = "/".join(dest.split("/")[:-1])
-        if not os.path.isdir(dest_dir):
-            os.makedirs(dest_dir)
-    else:
-        dest_dir = "."
-
-    if _id.startswith("https://"):
-        command = """wget -O %s %s""" % (dest, _id)
-    else:
-        command = """wget --load-cookies /tmp/cookies.txt "https://docs.google.com/uc?export=download&confirm=$(wget --quiet --save-cookies /tmp/cookies.txt --keep-session-cookies --no-check-certificate 'https://docs.google.com/uc?export=download&id=%s' -O- | sed -rn 's/.*confirm=([0-9A-Za-z_]+).*/\\1\\n/p')&id=%s" -O %s && rm -rf /tmp/cookies.txt""" % (_id, _id, dest)
-
-    ret_code = subprocess.run([command], shell=True)
-    if ret_code.returncode != 0:
-        print("Download {} ... [Failed]".format(dest))
-    else:
-        print("Download {} ... [Success]".format(dest))
-
-    if dest.endswith(".zip"):
-        command = """unzip %s -d %s && rm %s""" % (dest, dest_dir, dest)
-
-        ret_code = subprocess.run([command], shell=True)
-        if ret_code.returncode != 0:
-            print("Unzip {} ... [Failed]".format(dest))
-        else:
-            print("Unzip {} ... [Success]".format(dest))
-
-
-
 def smart_tokenizer_and_embedding_resize(special_tokens_dict, tokenizer, model):
     """Resize tokenizer and embedding.
 
@@ -65,38 +24,52 @@ def smart_tokenizer_and_embedding_resize(special_tokens_dict, tokenizer, model):
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
-def recover_instruct_llama(path_raw, output_path, device="cpu", test_recovered_model=True):
-    """Heavily adapted from https://github.com/tatsu-lab/stanford_alpaca/blob/main/weight_diff.py."""
-
-    model_raw = transformers.AutoModelForCausalLM.from_pretrained(
-        path_raw,
+def recover_instruct_llama(cpt_path, output_path, device="cpu", test_recovered_model=True):
+    """
+    continual_pretrain + (instruct - base) = improved model
+    """
+    model_cpt = transformers.AutoModelForCausalLM.from_pretrained(
+        cpt_path,
         device_map={"": torch.device(device)},
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
     )
-    model_recovered = transformers.AutoModelForCausalLM.from_pretrained(
-        "kalpeshk2011/instruct-llama-7b-wdiff",
+    model_instruct = transformers.AutoModelForCausalLM.from_pretrained(
+        "/root/CKM/model/Meta-Llama-3-8B-Instruct",
+        device_map={"": torch.device(device)},
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+    )
+    model_base = transformers.AutoModelForCausalLM.from_pretrained(
+        "/root/CKM/model/Meta-Llama-3-8B",
         device_map={"": torch.device(device)},
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
     )
 
-    tokenizer_raw = transformers.AutoTokenizer.from_pretrained(path_raw)
-    if tokenizer_raw.pad_token is None:
+    tokenizer_base = transformers.AutoTokenizer.from_pretrained("/root/CKM/model/Meta-Llama-3-8B")
+    if tokenizer_base.pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token="[PAD]"),
-            model=model_raw,
-            tokenizer=tokenizer_raw,
+            model=model_base,
+            tokenizer=tokenizer_base,
         )
-    tokenizer_recovered = transformers.AutoTokenizer.from_pretrained("kalpeshk2011/instruct-llama-7b-wdiff")
-
-    state_dict_recovered = model_recovered.state_dict()
-    state_dict_raw = model_raw.state_dict()
-    for key in tqdm.tqdm(state_dict_recovered):
-        state_dict_recovered[key].add_(state_dict_raw[key])
+    tokenizer_recovered = transformers.AutoTokenizer.from_pretrained("/root/CKM/model/Meta-Llama-3-8B-Instruct")
+    
+    state_dict_cpt = model_cpt.state_dict()
+    state_dict_instruct = model_instruct.state_dict()
+    state_dict_base = model_base.state_dict()
+    
+    for key in tqdm.tqdm(state_dict_cpt):
+        # wdiff = instruct - base
+        # result = cp + (instruct - base) = cp + instruct - base
+        state_dict_cpt[key].add_(state_dict_instruct[key])
+        state_dict_cpt[key].sub_(state_dict_base[key])
+    
+    model_cpt.load_state_dict(state_dict_cpt)
 
     if output_path is not None:
-        model_recovered.save_pretrained(output_path)
+        model_cpt.save_pretrained(output_path)
         tokenizer_recovered.save_pretrained(output_path)
 
     if test_recovered_model:

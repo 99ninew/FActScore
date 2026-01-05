@@ -89,12 +89,17 @@ def convert_model_to_int8_on_gpu(model, device):
     if 'cuda' not in device:
         raise ValueError(f"Target device should be a gpu. Device {device} is not supported")
 
+    # is_meta = any(param.is_meta for param in model.parameters())
+    # if is_meta:
+    #     model = model.to_empty(device=device)
+    
     model.half()
 
     memory_before_quantization = get_memory_footprint(model)  # without lm_head
 
     ـreplace_linear_with_int8linear(model)  # replace `Linear` with `QuantizedLinearInt8`
 
+    # if not is_meta: 
     model.to(device=device)
     memory_after_quantization = get_memory_footprint(model)  # without lm_head
 

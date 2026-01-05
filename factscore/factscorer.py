@@ -4,6 +4,7 @@ import json
 import numpy as np
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from tqdm import tqdm
 from factscore.abstain_detection import is_response_abstained
@@ -12,6 +13,12 @@ from factscore.clm import CLM
 from factscore.npm import NPM
 from factscore.openai_lm import OpenAIModel
 from factscore.retrieval import DocDB, Retrieval
+
+# python -m factscore.factscorer --input_path .cache/factscore/data/labeled/InstructGPT.jsonl \
+#      --model_name retrieval+llama+npm --use_atomic_facts --verbose --abstain_detection generic
+
+# python -m factscore.factscorer --input_path .cache/factscore/data/labeled/InstructGPT.jsonl \
+#      --model_name retrieval+ChatGPT --openai_key .cache/factscore/api_key.txt --verbose --abstain_detection generic
 
 class FactScorer(object):
 
@@ -23,9 +30,11 @@ class FactScorer(object):
                  openai_key="api.key",
                  cost_estimate="consider_cache",
                  abstain_detection_type=None,
-                 batch_size=256):
+                 batch_size=256,
+                 log_file=None):
         assert model_name in ["retrieval+llama", "retrieval+llama+npm", "retrieval+ChatGPT", "npm", "retrieval+ChatGPT+npm"]
         self.model_name = model_name
+        self.log_file = log_file if log_file else os.path.join(cache_dir, "atomic_facts.log")
 
         self.db = {}
         self.retrieval = {}
@@ -47,9 +56,18 @@ class FactScorer(object):
                           model_dir=os.path.join(model_dir, "inst-llama-7B"),
                           cache_file=os.path.join(cache_dir, "inst-llama-7B.pkl"))
         elif "ChatGPT" in model_name:
-            self.lm = OpenAIModel("ChatGPT",
-                                  cache_file=os.path.join(cache_dir, "ChatGPT.pkl"),
-                                  key_path=openai_key)
+            self.lm = CLM("inst-llama-7B",
+                          model_dir=os.path.join(model_dir, "inst-llama-7B"),
+                          cache_file=os.path.join(cache_dir, "inst-llama-7B.pkl"))
+            # self.lm = OpenAIModel("ChatGPT",
+            #                       cache_file=os.path.join(cache_dir, "ChatGPT.pkl"),
+            #                       key_path=openai_key)
+            # self.lm = OpenAIModel("gpt-oss-120b",
+            #                       cache_file=os.path.join(cache_dir, "gpt-oss-120b.pkl"),
+            #                       key_path=openai_key)
+            # self.lm = OpenAIModel("deepseek-v3.2",
+            #                       cache_file=os.path.join(cache_dir, "deepseek-v3dot2.pkl"),
+            #                       key_path=openai_key)
         else:
             self.lm = None
 
@@ -62,7 +80,8 @@ class FactScorer(object):
         for k, v in self.retrieval.items():
             v.save_cache()
 
-    def register_knowledge_source(self, name="enwiki-20230401", db_path=None, data_path=None):
+    # def register_knowledge_source(self, name="enwiki-20230401", db_path=None, data_path=None):
+    def register_knowledge_source(self, name="enwiki-20230401_plus_wikidata_append", db_path=None, data_path=None):
         assert name not in self.retrieval, f"{name} already registered"
         if db_path is None:
             db_path = os.path.join(self.data_dir, f"{name}.db")
@@ -95,6 +114,10 @@ class FactScorer(object):
             rate = 0.02
         elif model == "gpt-3.5-turbo":
             rate = 0.002
+        elif model == "deepseek-v3.2":
+            rate = 0.002
+        elif model == "gpt-oss-120b":
+            rate = 0.0008
 
         total_cost = total_tokens * rate / 1000
 
@@ -110,7 +133,8 @@ class FactScorer(object):
                   verbose=False):
         if knowledge_source is None:
             # use the default knowledge source
-            knowledge_source = "enwiki-20230401"
+            # knowledge_source = "enwiki-20230401"
+            knowledge_source = "enwiki-20230401_plus_wikidata_append"
 
         if knowledge_source not in self.retrieval:
             self.register_knowledge_source(knowledge_source)
@@ -126,22 +150,34 @@ class FactScorer(object):
             assert len(topics)==len(atomic_facts), "`topics` and `atomic_facts` should have the same length"
         else:
             if self.af_generator is None:
+                # self.af_generator = AtomicFactGenerator(key_path=self.openai_key,
+                #                                         demon_dir=os.path.join(self.data_dir, "demos"),
+                #                                         gpt3_cache_file=os.path.join(self.cache_dir, "InstructGPT.pkl"))
                 self.af_generator = AtomicFactGenerator(key_path=self.openai_key,
                                                         demon_dir=os.path.join(self.data_dir, "demos"),
-                                                        gpt3_cache_file=os.path.join(self.cache_dir, "InstructGPT.pkl"))
+                                                        gpt3_cache_file=os.path.join(self.cache_dir, "atomic_deepseek-v3dot2.pkl"),
+                                                        log_file=self.log_file)
 
             # estimate the total cost of atomic fact generation
             total_words = 0
             for gen in generations:
                 total_words += self.af_generator.run(gen, cost_estimate=self.cost_estimate)
 
-            self.print_cost_estimates(total_words, task="atomic fact generation", model="davinci-003")
-
-            if verbose:
-                topics = tqdm(topics)
+            # self.print_cost_estimates(total_words, task="atomic fact generation", model="davinci-003")
+            self.print_cost_estimates(total_words, task="atomic fact generation", model="gpt-oss-120b")
+            # self.print_cost_estimates(total_words, task="atomic fact generation", model="deepseek-v3.2")
 
             atomic_facts = []
-            for topic, gen in zip(topics, generations):
+            
+            # use tqdm 
+            iterator = tqdm(
+                zip(topics, generations),
+                total=len(topics),
+                desc="Extracting atomic facts",
+                disable=not verbose
+            ) if verbose else zip(topics, generations)
+            
+            for topic, gen in iterator:
                 # optionally, first detect if the response is abstained
                 response_abstained = is_response_abstained(gen, self.abstain_detection_type)
                 if response_abstained:
@@ -168,31 +204,48 @@ class FactScorer(object):
             for topic, generation, facts in zip(topics, generations, atomic_facts):
                 if facts is not None:
                     total_words += self._get_score(topic, generation, facts, knowledge_source, cost_estimate=self.cost_estimate)
-
-            self.print_cost_estimates(total_words, task="factscore evaluation", model="gpt-3.5-turbo")
-
-        if verbose:
-            topics = tqdm(topics)
+            # factscore evaluation process uses a local llama-2-7b instruct model, so no extra cost for calling.
+            # self.print_cost_estimates(total_words, task="factscore evaluation", model="gpt-3.5-turbo")
+            # self.print_cost_estimates(total_words, task="factscore evaluation", model="gpt-oss-120b")
+            # self.print_cost_estimates(total_words, task="factscore evaluation", model="deepseek-v3.2")
 
         scores = []
         init_scores = []
         decisions = []
-        for topic, generation, facts in zip(topics, generations, atomic_facts):
+        
+        def process_item(item):
+            topic, generation, facts = item
             if facts is None:
-                decisions.append(None)
-            else:
-                decision = self._get_score(topic, generation, facts, knowledge_source)
-                score = np.mean([d["is_supported"] for d in decision])
-                
-                if gamma:
-                    init_scores.append(score)
-                    penalty = 1.0 if len(facts)>gamma else np.exp(1-gamma/len(facts))
-                    score = penalty * score
-                
-                decisions.append(decision)
-                scores.append(score)
-                if len(scores) % 10 == 0:
-                    self.save_cache()
+                return None
+            decision = self._get_score(topic, generation, facts, knowledge_source)
+            score = np.mean([d["is_supported"] for d in decision])
+            init_score = score
+            if gamma:
+                penalty = 1.0 if len(facts)>gamma else np.exp(1-gamma/len(facts))
+                score = penalty * score
+            return (decision, score, init_score)
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # use tqdm 
+            iterator = tqdm(
+                executor.map(process_item, zip(topics, generations, atomic_facts)),
+                total=len(topics),
+                desc="Evaluating facts and scoring",
+                disable=not verbose
+            ) if verbose else executor.map(process_item, zip(topics, generations, atomic_facts))
+            
+            for res in iterator:
+                if res is None:
+                    decisions.append(None)
+                else:
+                    decision, score, init_score = res
+                    decisions.append(decision)
+                    scores.append(score)
+                    if gamma:
+                        init_scores.append(init_score)
+                    
+                    if len(scores) % 10 == 0:
+                        self.save_cache()
 
         self.save_cache()
 
@@ -258,7 +311,8 @@ class FactScorer(object):
                 npprob = self.npm[knowledge_source].get_probabilty(topic, atom)
                 is_supported = npprob > 0.3
 
-            decisions.append({"atom": atom, "is_supported": is_supported})
+            # Convert to Python bool for JSON serialization
+            decisions.append({"atom": atom, "is_supported": bool(is_supported)})
 
         if cost_estimate:
             return total_words
@@ -294,6 +348,10 @@ if __name__ == '__main__':
     parser.add_argument('--knowledge_source',
                         type=str,
                         default=None)
+    parser.add_argument('--log_file',
+                        type=str,
+                        default=None,
+                        help="Path to the log file for atomic facts generation. Default: .cache/factscore/atomic_facts.log")
 
 
     parser.add_argument('--cost_estimate',
@@ -328,7 +386,8 @@ if __name__ == '__main__':
                     cache_dir=args.cache_dir,
                     openai_key=args.openai_key,
                     cost_estimate=args.cost_estimate,
-                    abstain_detection_type=args.abstain_detection_type)
+                    abstain_detection_type=args.abstain_detection_type,
+                    log_file=args.log_file)
 
     tot = 0
     topics, generations, atomic_facts = [], [], []
@@ -361,6 +420,6 @@ if __name__ == '__main__':
     logging.critical("# Atomic facts per valid response = %.1f" % (out["num_facts_per_response"]))
 
     # Save out as a json file
-    with open(args.input_path.replace(".jsonl", f"_factscore_output.json"), 'w') as f:
+    with open(args.input_path.replace(".jsonl", f"_factscore_output_plus_wikidata_npm.json"), 'w') as f:
         f.write(json.dumps(out) + "\n")
 

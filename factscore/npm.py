@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import time
+import os
 from collections import defaultdict
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
@@ -29,9 +30,41 @@ class NPM(LM):
         super().__init__(cache_file=cache_file)
 
     def load_model(self):
-        self.model = AutoModelForMaskedLM.from_pretrained("facebook/" + self.model_name)
-        self.model.cuda()
+        # NPM (masked LM) is small; keeping it on a single device avoids device_map/meta issues.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        device_str = os.environ.get("FACTSCORE_NPM_DEVICE")
+        if device_str is None:
+            device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = torch.device(device_str)
+
+        # Force materialized weights on CPU first; avoids meta-parameter init in some setups.
+        self.model = AutoModelForMaskedLM.from_pretrained(
+            "facebook/" + self.model_name,
+            low_cpu_mem_usage=False,
+        )
+        # Guard: if any params are meta, something went wrong with loading/caching.
+        if any(p.is_meta for p in self.model.parameters()):
+            raise RuntimeError(
+                "NPM model parameters are on the meta device (weights not materialized). "
+                "This usually means a broken/incomplete checkpoint cache or an interrupted download. "
+                "Try deleting the HuggingFace cache folder for this model and re-run. "
+                "Typical locations: ~/.cache/huggingface/hub/models--facebook--npm-single or ~/.cache/huggingface/hub/models--facebook--npm-single*"
+            )
+
+        self.model.to(device)
         self.model.eval()
+
+    def _model_device(self) -> torch.device:
+        if self.model is None:
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # For sharded models, parameters can live on different devices.
+        # For this masked LM, picking the first parameter device is good enough.
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def save_cache(self):
         super().save_cache()
@@ -66,10 +99,11 @@ class NPM(LM):
         if gt_input_ids is not None:
             assert len(texts)==len(gt_input_ids)
         all_input_ids, all_attention_mask = self.tokenize(texts, skip_special_tokens=skip_special_tokens)
-        
+        device = self._model_device()
+
         with torch.no_grad():
-            outputs = self.model(all_input_ids.cuda(),
-                                 all_attention_mask.cuda(),
+            outputs = self.model(all_input_ids.to(device),
+                                 all_attention_mask.to(device),
                                  output_hidden_states=True,
                                  return_dict=True)
             all_logits = outputs["logits"].detach().cpu().numpy()
@@ -93,6 +127,13 @@ class NPM(LM):
     def get_probabilty(self, topic, question):
         passages = self.bm25.get_passages(topic, question, k=3)
         passages = [p["text"].strip() for p in passages]
+        # guard: if no passages retrieved, avoid calling tokenizer with empty list
+        if len(passages) == 0:
+            # cache and return zero probability when no evidence is available
+            cache_key = question + "#" + "#".join(passages)
+            self.cache_dict[cache_key] = 0.0
+            self.add_n += 1
+            return 0.0
         cache_key = question + "#" + "#".join(passages)
         
         if cache_key not in self.cache_dict:
@@ -102,6 +143,12 @@ class NPM(LM):
                 stacked_passage_tokens += input_ids
                 if len(vectors)>0:
                     stacked_passage_vectors.append(vectors)
+            if len(stacked_passage_vectors) == 0:
+                # no vectors available from passages -> treat as no evidence
+                cache_key = question + "#" + "#".join(passages)
+                self.cache_dict[cache_key] = 0.0
+                self.add_n += 1
+                return 0.0
             stacked_passage_vectors = np.concatenate(stacked_passage_vectors, 0)
             
             question_input_ids = self.tokenize(["Fact: " + question], skip_special_tokens=False, padding=False)[0]

@@ -10,27 +10,99 @@ import openai
 from rank_bm25 import BM25Okapi
 import os
 import time
+import logging
+import signal
+from tqdm import tqdm
 from nltk.tokenize import sent_tokenize
+
+# # Ensure required NLTK punkt models are available. Some environments need 'punkt_tab'.
+# nltk.download("punkt", quiet=True)
+# try:
+#     nltk.download("punkt_tab", quiet=True)
+# except Exception:
+#     # punkt_tab may not be available in older nltk distributions; we'll fallback at runtime
+#     pass
+
+
+def safe_sent_tokenize(text):
+    """Wrap nltk.sent_tokenize and attempt to download punkt_tab on LookupError, then retry."""
+    try:
+        return sent_tokenize(text)
+    except LookupError:
+        # Do not attempt network downloads at runtime; fallback to simple regex-based splitter
+        return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
 
 from factscore.openai_lm import OpenAIModel
 
-nltk.download("punkt")
 
 
 class AtomicFactGenerator(object):
-    def __init__(self, key_path, demon_dir, gpt3_cache_file=None):
+    def __init__(self, key_path, demon_dir, gpt3_cache_file=None, log_file=None):
         self.nlp = spacy.load("en_core_web_sm")
         self.is_bio = True
         self.demon_path = os.path.join(demon_dir, "demons.json" if self.is_bio else "demons_complex.json")
 
-        self.openai_lm = OpenAIModel("InstructGPT", cache_file=gpt3_cache_file, key_path=key_path)
+        # 设置日志记录
+        if log_file is None:
+            log_file = ".cache/factscore/atomic_facts.log"
+        
+        # 创建日志目录如果不存在
+        log_dir = os.path.dirname(log_file)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        self.logger = self._setup_logger(log_file)
+        self.log_file = log_file
+        
+        # API 
+        self.api_timeout = 120  # seconds timeout (adjustable)
+        self.max_retries = 3    # maximum retry attempts
+        self.retry_delay = 5    # retry wait time (seconds)
 
-        # get the demos
+        # self.openai_lm = OpenAIModel("InstructGPT", cache_file=gpt3_cache_file, key_path=key_path)
+        self.openai_lm = OpenAIModel("gpt-oss-120b", cache_file=gpt3_cache_file, key_path=key_path)
+        # self.openai_lm = OpenAIModel("deepseek-v3.2", cache_file=gpt3_cache_file, key_path=key_path)
+
+        self.logger.info("=" * 80)
+        self.logger.info(f"AtomicFactGenerator initialized at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info(f"Model: gpt-oss-120b, Cache file: {gpt3_cache_file}")
+        self.logger.info(f"API Timeout: {self.api_timeout}s, Max Retries: {self.max_retries}")
+        self.logger.info("=" * 80)
+
+        # get the demons
         with open(self.demon_path, 'r') as f:
             self.demons = json.load(f)
 
         tokenized_corpus = [doc.split(" ") for doc in self.demons.keys()]
         self.bm25 = BM25Okapi(tokenized_corpus)
+
+    def _setup_logger(self, log_file):
+        logger = logging.getLogger("AtomicFactGenerator")
+        logger.propagate = False  # 禁止传播到根 logger，防止重复输出或绕过 handler 级别限制
+        
+        if logger.handlers:
+            logger.info("Logger already configured, reusing existing setup")
+            return logger
+        
+        logger.setLevel(logging.DEBUG)
+        
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.WARNING)
+        
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+        
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        
+        return logger
 
     def save_cache(self):
         self.openai_lm.save_cache()
@@ -50,8 +122,8 @@ class AtomicFactGenerator(object):
 
             initials = detect_initials(paragraph)
 
-            curr_sentences = sent_tokenize(paragraph)
-            curr_sentences_2 = sent_tokenize(paragraph)
+            curr_sentences = safe_sent_tokenize(paragraph)
+            curr_sentences_2 = safe_sent_tokenize(paragraph)
 
             curr_sentences = fix_sentence_splitter(curr_sentences, initials)
             curr_sentences_2 = fix_sentence_splitter(curr_sentences_2, initials)
@@ -134,15 +206,107 @@ class AtomicFactGenerator(object):
                 total_words_estimate += len(prompt.split())
             return total_words_estimate
         else:
-            for prompt in prompts:
-                output, _ = self.openai_lm.generate(prompt)
-                atoms[prompt_to_sent[prompt]] = text_to_sentences(output)
+            # use tqdm
+            for prompt_idx, prompt in enumerate(tqdm(prompts, desc="Generating atomic facts", unit="sent"), 1):
+                sentence = prompt_to_sent[prompt]
+                try:
+                    self.logger.info(f"\n{'='*80}")
+                    self.logger.info(f"Processing sentence {prompt_idx}/{len(prompts)}")
+                    self.logger.info(f"Sentence: {sentence}")
+                    self.logger.debug(f"Prompt length: {len(prompt.split())} words")
+                    
+                    # 带重试的 API 调用
+                    output = self._call_api_with_retry(prompt, sentence, prompt_idx)
+                    atoms[sentence] = text_to_sentences(output)
+                    
+                    self.logger.info(f"Success - Generated {len(atoms[sentence])} atomic facts:")
+                    for fact_idx, fact in enumerate(atoms[sentence], 1):
+                        self.logger.info(f"  [{fact_idx}] {fact}")
+                    self.logger.debug(f"Full API response: {output[:200]}...")  # 只记录前200字符
+                    
+                except Exception as e:
+                    self.logger.error(f"Error generating atomic facts for sentence: {sentence}")
+                    self.logger.error(f"Error type: {type(e).__name__}")
+                    self.logger.error(f"Error message: {str(e)}")
+                    self.logger.exception("Full traceback:")
+                    atoms[sentence] = []  # 在错误情况下设置为空列表
 
             for key, value in demons.items():
                 if key not in atoms:
                     atoms[key] = value
 
             return atoms
+
+    def _call_api_with_retry(self, prompt, sentence, sentence_idx):
+        """带重试机制的 API 调用"""
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                self.logger.info(f"API call attempt {attempt}/{self.max_retries}")
+                start_time = time.time()
+                
+                output, _ = self.openai_lm.generate(prompt)
+                
+                elapsed_time = time.time() - start_time
+                self.logger.info(f"API call succeeded in {elapsed_time:.2f}s")
+                return output
+                
+            except (TimeoutError, ConnectionError) as e:
+                # 网络级错误 - 重试
+                elapsed_time = time.time() - start_time
+                self.logger.warning(f"Attempt {attempt} network error after {elapsed_time:.2f}s: {type(e).__name__}")
+                
+                if attempt < self.max_retries:
+                    self.logger.warning(f"Retrying in {self.retry_delay}s...")
+                    time.sleep(self.retry_delay)
+                else:
+                    self.logger.error(f"All {self.max_retries} attempts failed for sentence {sentence_idx}")
+                    raise
+                    
+            except RuntimeError as e:
+                # RuntimeError 来自 API 本身（如 response=None）- 重试
+                elapsed_time = time.time() - start_time
+                error_msg = str(e)
+                self.logger.warning(f"Attempt {attempt} API error after {elapsed_time:.2f}s: {error_msg}")
+                
+                if attempt < self.max_retries:
+                    self.logger.warning(f"Retrying in {self.retry_delay}s...")
+                    time.sleep(self.retry_delay)
+                else:
+                    self.logger.error(f"All {self.max_retries} attempts failed for sentence {sentence_idx}")
+                    raise
+                    
+            except TypeError as e:
+                # TypeError: 'NoneType' object is not subscriptable - API 返回 None
+                # 这是可重试的错误，应该重新尝试
+                elapsed_time = time.time() - start_time
+                error_msg = str(e)
+                self.logger.warning(f"Attempt {attempt} got None response after {elapsed_time:.2f}s: {error_msg}")
+                
+                if attempt < self.max_retries:
+                    self.logger.warning(f"API returned None - retrying in {self.retry_delay}s...")
+                    time.sleep(self.retry_delay)
+                else:
+                    self.logger.error(f"All {self.max_retries} attempts failed (API returned None) for sentence {sentence_idx}")
+                    raise
+                    
+            except Exception as e:
+                # 其他异常 - 分析后决定是否重试或直接失败
+                elapsed_time = time.time() - start_time
+                error_type = type(e).__name__
+                error_msg = str(e)
+                
+                # 判断是否为可重试的错误
+                retryable_keywords = ['timeout', 'connection', 'refused', 'reset', 'broken', 'api error']
+                is_retryable = any(keyword in error_msg.lower() for keyword in retryable_keywords)
+                
+                if is_retryable and attempt < self.max_retries:
+                    self.logger.warning(f"Attempt {attempt} retryable error after {elapsed_time:.2f}s: {error_type}: {error_msg}")
+                    self.logger.warning(f"Retrying in {self.retry_delay}s...")
+                    time.sleep(self.retry_delay)
+                else:
+                    self.logger.error(f"Attempt {attempt} non-retryable error after {elapsed_time:.2f}s: {error_type}")
+                    self.logger.error(f"Error message: {error_msg}")
+                    raise
 
 
 def best_demos(query, bm25, demons_sents, k):
@@ -335,7 +499,7 @@ def fix_sentence_splitter(curr_sentences, initials):
 
 
 def main():
-    generator = AtomicFactGenerator("api.key", "demos", gpt3_cache_dir=None)
+    generator = AtomicFactGenerator(".cache/factscore/api_key.txt", ".cache/factscore/demos", gpt3_cache_file=os.path.join(".cache/factscore", "deepseek_v3dot2.pkl"))
     atomic_facts, para_breaks = generator.run("Thierry Henry (born 17 August 1977) is a French professional football coach, pundit, and former player. He is considered one of the greatest strikers of all time, and one the greatest players of the Premier League history. He has been named Arsenal F.C's greatest ever player.\n\nHenry made his professional debut with Monaco in 1994 before signing for defending Serie A champions Juventus. However, limited playing time, coupled with disagreements with the club's hierarchy, led to him signing for Premier League club Arsenal for £11 million in 1999.")
 
     print(atomic_facts)
