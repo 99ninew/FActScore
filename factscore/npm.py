@@ -39,13 +39,13 @@ class NPM(LM):
             device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
         device = torch.device(device_str)
 
-        # Force materialized weights on CPU first; avoids meta-parameter init in some setups.
-        self.model = AutoModelForMaskedLM.from_pretrained(
+        # Load into a local variable first so other threads can't observe a partially-moved model.
+        model = AutoModelForMaskedLM.from_pretrained(
             "facebook/" + self.model_name,
             low_cpu_mem_usage=False,
         )
         # Guard: if any params are meta, something went wrong with loading/caching.
-        if any(p.is_meta for p in self.model.parameters()):
+        if any(p.is_meta for p in model.parameters()):
             raise RuntimeError(
                 "NPM model parameters are on the meta device (weights not materialized). "
                 "This usually means a broken/incomplete checkpoint cache or an interrupted download. "
@@ -53,8 +53,9 @@ class NPM(LM):
                 "Typical locations: ~/.cache/huggingface/hub/models--facebook--npm-single or ~/.cache/huggingface/hub/models--facebook--npm-single*"
             )
 
-        self.model.to(device)
-        self.model.eval()
+        model.to(device)
+        model.eval()
+        self.model = model
 
     def _model_device(self) -> torch.device:
         if self.model is None:
@@ -95,7 +96,10 @@ class NPM(LM):
     def encode(self, texts, skip_special_tokens=False, gt_input_ids=None):
         assert type(texts)==list
         if self.model is None:
-            self.load_model()
+            # Thread-safe lazy init: FactScorer can call NPM from multiple threads.
+            with self._model_init_lock:
+                if self.model is None:
+                    self.load_model()
         if gt_input_ids is not None:
             assert len(texts)==len(gt_input_ids)
         all_input_ids, all_attention_mask = self.tokenize(texts, skip_special_tokens=skip_special_tokens)
@@ -127,85 +131,75 @@ class NPM(LM):
     def get_probabilty(self, topic, question):
         passages = self.bm25.get_passages(topic, question, k=3)
         passages = [p["text"].strip() for p in passages]
+        cache_key = question + "#" + "#".join(passages)
+
+        with self.lock:
+            if cache_key in self.cache_dict:
+                return self.cache_dict[cache_key]
+
         # guard: if no passages retrieved, avoid calling tokenizer with empty list
         if len(passages) == 0:
-            # cache and return zero probability when no evidence is available
-            cache_key = question + "#" + "#".join(passages)
-            self.cache_dict[cache_key] = 0.0
-            self.add_n += 1
-            return 0.0
-        cache_key = question + "#" + "#".join(passages)
-        
-        if cache_key not in self.cache_dict:
-            encoded = self.encode(passages, skip_special_tokens=True)
-            stacked_passage_tokens, stacked_passage_vectors = [], []
-            for input_ids, vectors in encoded:
-                stacked_passage_tokens += input_ids
-                if len(vectors)>0:
-                    stacked_passage_vectors.append(vectors)
-            if len(stacked_passage_vectors) == 0:
-                # no vectors available from passages -> treat as no evidence
-                cache_key = question + "#" + "#".join(passages)
+            with self.lock:
                 self.cache_dict[cache_key] = 0.0
                 self.add_n += 1
-                return 0.0
-            stacked_passage_vectors = np.concatenate(stacked_passage_vectors, 0)
+            return 0.0
+
+        encoded = self.encode(passages, skip_special_tokens=True)
+        stacked_passage_tokens, stacked_passage_vectors = [], []
+        for input_ids, vectors in encoded:
+            stacked_passage_tokens += input_ids
+            if len(vectors) > 0:
+                stacked_passage_vectors.append(vectors)
+        if len(stacked_passage_vectors) == 0:
+            with self.lock:
+                self.cache_dict[cache_key] = 0.0
+                self.add_n += 1
+            return 0.0
+        stacked_passage_vectors = np.concatenate(stacked_passage_vectors, 0)
+        
+        question_input_ids = self.tokenize(["Fact: " + question], skip_special_tokens=False, padding=False)[0]
+        if 2 in question_input_ids:
+            question_input_ids = question_input_ids[:question_input_ids.index(2)]
+        question_input_ids = question_input_ids[1:]
+
+        triples = []
+        batch = []
+        gt_input_ids = []
+        prefix = True
+        for i, input_id in enumerate(question_input_ids):
+            if prefix:
+                if input_id == 35:  # the end of prefix
+                    prefix = False
+                continue
+            if input_id in [0, 2] or input_id in self.stopwords:
+                continue
+            batch.append(self.decode(question_input_ids[:i] + [self.mask_id] + question_input_ids[i+1:]))
+            gt_input_ids.append(input_id)
+
+        for (prob, vector), gt_input_id in zip(self.encode(batch, gt_input_ids=gt_input_ids), gt_input_ids):
+            triples.append((prob, vector, gt_input_id))
+
+        stacked_question_vectors = np.stack([v for _, v, _ in triples], 0)
+        all_scores = np.exp(np.inner(stacked_question_vectors, stacked_passage_vectors) / np.sqrt(stacked_passage_vectors.shape[-1]))
+
+        probs = []
+        for (softmax_prob, vector, input_id), scores in zip(triples, all_scores):
+            assert len(stacked_passage_tokens) == len(scores)
+            if input_id not in stacked_passage_tokens:
+                probs.append(0)
+            else:
+                aggregated_scores = defaultdict(list)
+                for token, score in zip(stacked_passage_tokens, scores):
+                    aggregated_scores[token].append(score)
+                tot = np.sum([np.sum(v) for v in aggregated_scores.values()])
+                prob = np.sum(aggregated_scores[input_id]) / tot
+                probs.append(prob)
             
-            question_input_ids = self.tokenize(["Fact: " + question], skip_special_tokens=False, padding=False)[0]
-            if 2 in question_input_ids:
-                question_input_ids = question_input_ids[:question_input_ids.index(2)]
-            question_input_ids = question_input_ids[1:]
-
-            '''
-            triples = []
-            prefix = True
-            for i, input_id in enumerate(question_input_ids):
-                if prefix:
-                    if input_id==35: # the end of prefix
-                        prefix = False
-                    continue
-                if input_id in [0, 2] or input_id in self.stopwords:
-                    continue
-                new_question = self.decode(question_input_ids[:i] + [self.mask_id] + question_input_ids[i+1:])
-                prob, vector = self.encode(new_question, gt_input_id=input_id)
-                triples.append((prob, vector, input_id))
-            '''
-            triples = []
-            batch = []
-            gt_input_ids = []
-            prefix = True
-            for i, input_id in enumerate(question_input_ids):
-                if prefix:
-                    if input_id==35: # the end of prefix
-                        prefix = False
-                    continue
-                if input_id in [0, 2] or input_id in self.stopwords:
-                    continue
-                batch.append(self.decode(question_input_ids[:i] + [self.mask_id] + question_input_ids[i+1:]))
-                gt_input_ids.append(input_id)
-            for (prob, vector), gt_input_id in zip(self.encode(batch, gt_input_ids=gt_input_ids), gt_input_ids):
-                triples.append((prob, vector, gt_input_id))
-
-            stacked_question_vectors = np.stack([v for _, v, _ in triples], 0)
-            all_scores = np.exp(np.inner(stacked_question_vectors, stacked_passage_vectors) / np.sqrt(stacked_passage_vectors.shape[-1]))
-
-            probs = []
-            for (softmax_prob, vector, input_id), scores in zip(triples, all_scores):
-                assert len(stacked_passage_tokens)==len(scores)
-                if input_id not in stacked_passage_tokens:
-                    probs.append(0)
-                else:
-                    aggregated_scores = defaultdict(list)
-                    for token, score in zip(stacked_passage_tokens, scores):
-                        aggregated_scores[token].append(score)
-                    tot = np.sum([np.sum(v) for v in aggregated_scores.values()])
-                    prob = np.sum(aggregated_scores[input_id]) / tot
-                    probs.append(prob)
-            
-            self.cache_dict[cache_key] = np.mean(probs)
+        result = float(np.mean(probs))
+        with self.lock:
+            self.cache_dict[cache_key] = result
             self.add_n += 1
-
-        return self.cache_dict[cache_key]
+        return result
 
 
 

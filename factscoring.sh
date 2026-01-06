@@ -1,8 +1,10 @@
 set -euo pipefail
 
+export FACTSCORE_SAVE_EVERY=200
+
 FILE_NAMES=(
      # "Bio-test_wikipage-quality-append-lr3e-06-rr0.9-epochs8-bs8-wd0.01-warmup0.05-MetaLlama38B" #plus_wikidata
-     "Bio-test_wikipage-quality-append-lr6e-06-rr0.9-epochs8-bs8-wd0.01-warmup0.05-MetaLlama38B"
+     # "Bio-test_wikipage-quality-append-lr6e-06-rr0.9-epochs8-bs8-wd0.01-warmup0.05-MetaLlama38B"
      "Bio-test_wikipage-quality-append-lr8e-06-rr0.9-epochs8-bs8-wd0.01-warmup0.05-MetaLlama38B"
      "Bio-test_mix_wikidata_3+9_shuffle-quality-append-lr2e-05-rr0.9-epochs1-bs8-wd0.01-warmup0.05-MetaLlama38B"
      "Bio-test_mix_wikidata_6+6_shuffle-quality-append-lr2e-05-rr0.9-epochs1-bs8-wd0.01-warmup0.05-MetaLlama38B"

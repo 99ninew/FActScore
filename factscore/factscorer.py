@@ -244,7 +244,8 @@ class FactScorer(object):
                     if gamma:
                         init_scores.append(init_score)
                     
-                    if len(scores) % 10 == 0:
+                    save_every = int(os.environ.get("FACTSCORE_SAVE_EVERY", "10"))
+                    if save_every > 0 and len(scores) % save_every == 0:
                         self.save_cache()
 
         self.save_cache()

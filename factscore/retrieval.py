@@ -1,6 +1,7 @@
 import json
 import time
 import os
+import threading
 
 import sqlite3
 import numpy as np
@@ -125,6 +126,7 @@ class Retrieval(object):
         assert retrieval_type=="bm25" or retrieval_type.startswith("gtr-")
         
         self.encoder = None
+        self.lock = threading.RLock()
         self.load_cache()
         self.add_n = 0
         self.add_n_embed = 0
@@ -173,12 +175,23 @@ class Retrieval(object):
                 self.embed_cache = {}
     
     def save_cache(self):
-        if self.add_n > 0:
+        with self.lock:
+            add_n = self.add_n
+            add_n_embed = self.add_n_embed
+
+        if add_n <= 0 and add_n_embed <= 0:
+            return
+
+        with self.lock:
+            cache_snapshot = dict(self.cache)
+            embed_snapshot = dict(self.embed_cache)
+
+        if add_n > 0:
             if os.path.exists(self.cache_path):
                 try:
                     with open(self.cache_path, "r", encoding="utf-8") as f:
                         new_cache = json.load(f)
-                    self.cache.update(new_cache)
+                    cache_snapshot.update(new_cache)
                 except Exception as e:
                     backup_path = self.cache_path + ".corrupt"
                     try:
@@ -194,7 +207,7 @@ class Retrieval(object):
             tmp_fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(self.cache_path) + ".", dir=os.path.dirname(self.cache_path) or None)
             try:
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                    json.dump(self.cache, f)
+                    json.dump(cache_snapshot, f)
                 os.replace(tmp_path, self.cache_path)
             finally:
                 try:
@@ -220,11 +233,28 @@ class Retrieval(object):
                         f"({type(e).__name__}: {e}). Ignoring old embed cache; backed up to {backup_path!r} if possible."
                     )
 
+        if add_n_embed > 0:
+            if os.path.exists(self.embed_cache_path):
+                try:
+                    with open(self.embed_cache_path, "rb") as f:
+                        new_cache = pkl.load(f)
+                    embed_snapshot.update(new_cache)
+                except Exception as e:
+                    backup_path = self.embed_cache_path + ".corrupt"
+                    try:
+                        shutil.copy2(self.embed_cache_path, backup_path)
+                    except Exception:
+                        pass
+                    print(
+                        f"Warning: failed to merge existing embed cache {self.embed_cache_path!r} "
+                        f"({type(e).__name__}: {e}). Ignoring old embed cache; backed up to {backup_path!r} if possible."
+                    )
+
             # Atomic write for pickle as well
             tmp_fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(self.embed_cache_path) + ".", dir=os.path.dirname(self.embed_cache_path) or None)
             try:
                 with os.fdopen(tmp_fd, "wb") as f:
-                    pkl.dump(self.embed_cache, f)
+                    pkl.dump(embed_snapshot, f)
                 os.replace(tmp_path, self.embed_cache_path)
             finally:
                 try:
@@ -232,6 +262,11 @@ class Retrieval(object):
                         os.remove(tmp_path)
                 except Exception:
                     pass
+
+        # mark as clean (best effort)
+        with self.lock:
+            self.add_n = 0
+            self.add_n_embed = 0
 
     def get_bm25_passages(self, topic, query, passages, k):
         if topic in self.embed_cache:
@@ -265,25 +300,31 @@ class Retrieval(object):
         retrieval_query = topic + " " + question.strip()
         cache_key = topic + "#" + retrieval_query
         
-        if cache_key not in self.cache:
-            passages = self.db.get_text_from_title(topic)
-            # If the topic is not found in the DB, get_text_from_title returns None.
-            # Guard against passing None into the retrieval methods which expect an iterable.
-            if passages is None:
-                print(f"Topic '{topic}' not found in DB, skipping retrieval.")
-                # cache an empty list so subsequent calls are fast
+        with self.lock:
+            if cache_key in self.cache:
+                return self.cache[cache_key]
+
+
+        passages = self.db.get_text_from_title(topic)
+        # If the topic is not found in the DB, get_text_from_title returns None.
+        # Guard against passing None into the retrieval methods which expect an iterable.
+        if passages is None:
+            print(f"Topic '{topic}' not found in DB, skipping retrieval.")
+            # cache an empty list so subsequent calls are fast
+            with self.lock:
                 self.cache[cache_key] = []
                 self.add_n += 1
                 return self.cache[cache_key]
 
-            if self.retrieval_type=="bm25":
-                self.cache[cache_key] = self.get_bm25_passages(topic, retrieval_query, passages, k)
-            else:
-                self.cache[cache_key] = self.get_gtr_passages(topic, retrieval_query, passages, k)
-            # if passages is an empty list, allow empty cache result; otherwise length should match
-            if len(passages) > 0:
-                assert len(self.cache[cache_key]) in [k, len(passages)]
+        if self.retrieval_type=="bm25":
+            result = self.get_bm25_passages(topic, retrieval_query, passages, k)
+        else:
+            result = self.get_gtr_passages(topic, retrieval_query, passages, k)
+
+        with self.lock:
+            self.cache[cache_key] = result
             self.add_n += 1
+            return self.cache[cache_key]
         
             
         return self.cache[cache_key]

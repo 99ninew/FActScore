@@ -2,6 +2,7 @@ import pickle
 import os
 import time
 import threading
+import tempfile
 
 class LM(object):
 
@@ -10,7 +11,7 @@ class LM(object):
         self.cache_dict = self.load_cache()
         self.model = None
         self.add_n = 0
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self._model_init_lock = threading.Lock()
 
     def load_model(self):
@@ -42,16 +43,37 @@ class LM(object):
         return generated
 
     def save_cache(self):
+        # Take a snapshot under lock so other threads can keep running.
         with self.lock:
             if self.add_n == 0:
                 return
 
-            # load the latest cache first, since if there were other processes running in parallel, cache might have been updated
-            for k, v in self.load_cache().items():
-                self.cache_dict[k] = v
+        # Merge in any cache written by other processes.
+        try:
+            latest = self.load_cache(allow_retry=False)
+        except Exception:
+            latest = {}
 
-            with open(self.cache_file, "wb") as f:
-                pickle.dump(self.cache_dict, f)
+        with self.lock:
+            if latest:
+                self.cache_dict.update(latest)
+            snapshot = dict(self.cache_dict)
+
+        # Atomic write so readers never see a half-written pickle.
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(self.cache_file) + ".", dir=os.path.dirname(self.cache_file) or None)
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                pickle.dump(snapshot, f)
+            os.replace(tmp_path, self.cache_file)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+        with self.lock:
+            self.add_n = 0
 
     def load_cache(self, allow_retry=True):
         if os.path.exists(self.cache_file):
